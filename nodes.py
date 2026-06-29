@@ -17,6 +17,16 @@ from .ops import GGMLOps, move_patch_to_device
 from .loader import gguf_sd_loader, gguf_clip_loader
 from .dequant import is_quantized, is_torch_compatible
 
+MODEL_RESIDENCY_DEFAULT = "default (RAM/VRAM swap)"
+MODEL_RESIDENCY_RAM = "RAM only"
+MODEL_RESIDENCY_VRAM = "VRAM only"
+MODEL_RESIDENCY_MODES = [MODEL_RESIDENCY_DEFAULT, MODEL_RESIDENCY_RAM, MODEL_RESIDENCY_VRAM]
+
+def _normalize_model_residency(model_residency):
+    if model_residency in (None, "default"):
+        return MODEL_RESIDENCY_DEFAULT
+    return model_residency
+
 def update_folder_names_and_paths(key, targets=[]):
     # check for existing key
     base = folder_paths.folder_names_and_paths.get(key, ([], {}))
@@ -34,6 +44,25 @@ update_folder_names_and_paths("clip_gguf", ["text_encoders", "clip"])
 
 class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     patch_on_device = False
+    model_residency = MODEL_RESIDENCY_DEFAULT
+
+    def _cpu_offload_device(self):
+        try:
+            return comfy.model_management.unet_offload_device()
+        except Exception:
+            return torch.device("cpu")
+
+    def _apply_residency_devices(self):
+        self.model_residency = _normalize_model_residency(getattr(self, "model_residency", MODEL_RESIDENCY_DEFAULT))
+        if self.model_residency == MODEL_RESIDENCY_DEFAULT:
+            return
+
+        if self.model_residency == MODEL_RESIDENCY_RAM:
+            ram_device = self._cpu_offload_device()
+            self.load_device = ram_device
+            self.offload_device = ram_device
+        elif self.model_residency == MODEL_RESIDENCY_VRAM:
+            self.offload_device = self.load_device
 
     def patch_weight_to_device(self, key, device_to=None, inplace_update=False):
         if key not in self.patches:
@@ -90,6 +119,10 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
     named_modules_to_munmap = {}
 
     def load(self, *args, force_patch_weights=False, **kwargs):
+        self._apply_residency_devices()
+        if self.model_residency == MODEL_RESIDENCY_RAM:
+            kwargs["lowvram_model_memory"] = 0
+
         if not self.mmap_released:
             self.named_modules_to_munmap = dict(self.model.named_modules())
 
@@ -119,6 +152,15 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             self.mmap_released = True
             self.named_modules_to_munmap = {}
 
+    def model_patches_to(self, device):
+        if _normalize_model_residency(getattr(self, "model_residency", MODEL_RESIDENCY_DEFAULT)) == MODEL_RESIDENCY_RAM:
+            device = self.offload_device
+        return super().model_patches_to(device)
+
+    def model_dtype(self):
+        self._apply_residency_devices()
+        return super().model_dtype()
+
     def clone(self, *args, **kwargs):
         src_cls = self.__class__
         self.__class__ = GGUFModelPatcher
@@ -127,6 +169,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         self.__class__ = src_cls
         # GGUF specific clone values below
         n.patch_on_device = getattr(self, "patch_on_device", False)
+        n.model_residency = _normalize_model_residency(getattr(self, "model_residency", MODEL_RESIDENCY_DEFAULT))
         n.mmap_released = getattr(self, "mmap_released", False)
         if src_cls != GGUFModelPatcher:
             n.size = 0 # force recalc
@@ -147,7 +190,7 @@ class UnetLoaderGGUF:
     CATEGORY = "bootleg"
     TITLE = "Unet Loader (GGUF)"
 
-    def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None):
+    def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None, model_residency=MODEL_RESIDENCY_DEFAULT):
         ops = GGMLOps()
 
         if dequant_dtype in ("default", None):
@@ -181,6 +224,8 @@ class UnetLoaderGGUF:
             raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
         model = GGUFModelPatcher.clone(model)
         model.patch_on_device = patch_on_device
+        model.model_residency = _normalize_model_residency(model_residency)
+        model._apply_residency_devices()
         return (model,)
 
 class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
@@ -193,6 +238,7 @@ class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
                 "dequant_dtype": (["default", "target", "float32", "float16", "bfloat16"], {"default": "default"}),
                 "patch_dtype": (["default", "target", "float32", "float16", "bfloat16"], {"default": "default"}),
                 "patch_on_device": ("BOOLEAN", {"default": False}),
+                "model_residency": (MODEL_RESIDENCY_MODES, {"default": MODEL_RESIDENCY_DEFAULT}),
             }
         }
     TITLE = "Unet Loader (GGUF/Advanced)"
